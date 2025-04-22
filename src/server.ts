@@ -1,3 +1,4 @@
+// src/server.ts
 import express, { Request, Response } from "express";
 import cors from "cors";
 import { google } from "googleapis";
@@ -13,9 +14,7 @@ console.log("✅ TokenTrader iniciado...");
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const BOT_URL = process.env.BOT_URL;
 
-// Cargar credenciales desde credentials.json
 const credentialsPath = join(__dirname, "../credentials.json");
 const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf-8")).web;
 
@@ -23,7 +22,6 @@ const CLIENT_ID = credentials.client_id;
 const CLIENT_SECRET = credentials.client_secret;
 const REDIRECT_URI = credentials.redirect_uris[0];
 
-// URL externa para pedir el Cloudflare URL del bot
 const API_URL_CLOUDFLARE =
   process.env.API_URL_CLOUDFLARE ||
   "https://v539peby84.execute-api.us-east-2.amazonaws.com/lambda/GetCloudflareURLLambda";
@@ -31,47 +29,42 @@ const API_URL_CLOUDFLARE =
 app.use(cors());
 app.use(bodyParser.json());
 
-// Estado temporal por bot
 const solicitudesPendientes: Record<
   string,
-  { instance_name: string; token?: any }
+  { instance_name: string; url?: string; token?: any }
 > = {};
 
-// 0️⃣ - Ping para comprobar que el servicio está vivo
 app.get("/prueba", (_, res) => {
   console.log("⚙️  /prueba recibido");
   res.send("✅ TokenTrader activo y funcionando.");
 });
 
-// 1️⃣ - Endpoint para registrar solicitud de autorización desde el dashboard
 app.post("/register", async (req: Request, res: Response) => {
-  const { bot_id, instance_name } = req.body;
+  const { bot_id, instance_name, url } = req.body;
   if (!bot_id || !instance_name) {
     res.status(400).json({ error: "Faltan datos" });
     return;
   }
-  solicitudesPendientes[bot_id] = { instance_name };
+  solicitudesPendientes[bot_id] = { instance_name, url };
   console.log(
-    `📌 Registro de autorización solicitado para ${bot_id} con instancia '${instance_name}'`
+    `📌 Registro para ${bot_id} con instancia '${instance_name}' y url: ${
+      url ?? "<ninguno>"
+    }`
   );
   res.json({ status: "registrado" });
 });
 
-// 2️⃣ - Google Auth callback
 app.get("/auth/callback", async (req: Request, res: Response) => {
   const code = req.query.code as string;
   const bot_id = req.query.state as string;
 
   if (!code || !bot_id || !solicitudesPendientes[bot_id]) {
-    console.warn("⚠️ Callback recibido con datos incompletos", {
-      code,
-      bot_id,
-    });
+    console.warn("⚠️ Callback incompleto", { code, bot_id });
     res.status(400).send("Solicitud inválida o no registrada.");
     return;
   }
 
-  const instance_name = solicitudesPendientes[bot_id].instance_name;
+  const { instance_name, url } = solicitudesPendientes[bot_id];
   const oAuth2Client = new google.auth.OAuth2(
     CLIENT_ID,
     CLIENT_SECRET,
@@ -87,77 +80,38 @@ app.get("/auth/callback", async (req: Request, res: Response) => {
     res.send("✅ Autenticado correctamente. Puedes cerrar esta ventana.");
     console.log("✅ Token recibido. Enviando a la instancia...");
 
-    // Disparar automáticamente el despacho del token
-    await despacharToken(bot_id, tokens, instance_name);
+    const urlBot =
+      instance_name === "bot_nacho" ? url : await obtenerURLBot(instance_name);
+
+    if (!urlBot) {
+      throw new Error("No se pudo determinar la URL del bot");
+    }
+
+    const response = await fetch(`${urlBot}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bot_id, tokens }),
+    });
+
+    if (!response.ok) {
+      const errorMsg = await response.text();
+      throw new Error(`❌ Falló el envío al bot: ${errorMsg}`);
+    }
+
+    console.log(`🚀 Token enviado al bot ${bot_id} (${urlBot}) correctamente.`);
   } catch (err) {
     console.error("❌ Error en auth callback:", err);
-    res.status(500).send("Error procesando token");
   }
 });
 
-// 3️⃣ - Endpoint opcional para despachar token manualmente
-app.post("/dispatch", async (req: Request, res: Response) => {
-  const { bot_id } = req.body;
-  if (!bot_id || !solicitudesPendientes[bot_id]) {
-    res.status(400).json({ error: "Bot no registrado" });
-    return;
-  }
-
-  const { token, instance_name } = solicitudesPendientes[bot_id];
-
-  if (!token) {
-    res.status(400).json({ error: "Token de Google aún no recibido" });
-    return;
-  }
-
-  try {
-    await despacharToken(bot_id, token, instance_name);
-    res.json({ status: "Token enviado al bot con éxito" });
-  } catch (err) {
-    console.error("❌ Error en dispatch manual:", err);
-    res.status(500).json({ error: "Falló el despacho del token" });
-  }
-});
-
-// 4️⃣ - Lógica para enviar el token al bot destino
-const despacharToken = async (
-  bot_id: string,
-  token: any,
-  instance_name: string
-) => {
-  const urlBot = await obtenerURLBot(instance_name);
-  if (!urlBot) throw new Error("No se pudo obtener la URL del bot");
-
-  const resp = await fetch(`${urlBot}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bot_id, tokens: token }),
-  });
-
-  if (!resp.ok) {
-    const errorMsg = await resp.text();
-    throw new Error(`Error al enviar token: ${errorMsg}`);
-  }
-
-  console.log(`🚀 Token enviado al bot ${bot_id} (${urlBot}) correctamente.`);
-};
-
-// 5️⃣ - Función para obtener la URL del bot desde API externa o variable
 const obtenerURLBot = async (instance_name: string): Promise<string | null> => {
-  if (instance_name === "bot_nacho") {
-    console.log("🔁 Usando BOT_URL directamente para bot_nacho");
-    return BOT_URL ?? null;
-  }
-
   try {
     const res = await fetch(API_URL_CLOUDFLARE, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ instance_name, url: "true" }),
     });
-
     if (!res.ok) return null;
-
     const data = (await res.json()) as { url?: string };
     return data?.url ?? null;
   } catch (err) {
