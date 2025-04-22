@@ -3,7 +3,6 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-// src/server.ts
 const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
 const googleapis_1 = require("googleapis");
@@ -66,58 +65,62 @@ app.get("/auth/callback", async (req, res) => {
         solicitudesPendientes[bot_id].token = tokens;
         res.send("✅ Autenticado correctamente. Puedes cerrar esta ventana.");
         console.log("✅ Token recibido. Enviando a la instancia...");
+        // Disparar automáticamente el despacho del token
+        await despacharToken(bot_id, tokens, instance_name);
     }
     catch (err) {
         console.error("❌ Error en auth callback:", err);
         res.status(500).send("Error procesando token");
     }
 });
-// 3️⃣ - Endpoint para procesar el truque (verifica token + pide URL + envía al bot)
+// 3️⃣ - Endpoint opcional para despachar token manualmente
 app.post("/dispatch", async (req, res) => {
     const { bot_id } = req.body;
     if (!bot_id || !solicitudesPendientes[bot_id]) {
         res.status(400).json({ error: "Bot no registrado" });
         return;
     }
-    const instance_name = solicitudesPendientes[bot_id].instance_name;
-    const token = solicitudesPendientes[bot_id].token;
+    const { token, instance_name } = solicitudesPendientes[bot_id];
     if (!token) {
         res.status(400).json({ error: "Token de Google aún no recibido" });
         return;
     }
     try {
-        const urlBot = await obtenerURLBot(instance_name);
-        if (!urlBot) {
-            res.status(500).json({ error: "No se pudo obtener la URL del bot" });
-            return;
-        }
-        const resp = await (0, node_fetch_1.default)(`${urlBot}/oauth/token`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tokens: token }),
-        });
-        if (!resp.ok)
-            throw new Error("Error al enviar token al bot");
+        await despacharToken(bot_id, token, instance_name);
         res.json({ status: "Token enviado al bot con éxito" });
-        console.log(`🚀 Token enviado al bot ${bot_id} (${urlBot}) correctamente.`);
     }
     catch (err) {
-        console.error("❌ Error en dispatch:", err);
+        console.error("❌ Error en dispatch manual:", err);
         res.status(500).json({ error: "Falló el despacho del token" });
     }
 });
-// 4️⃣ - Función para obtener la URL del bot desde API externa o variable
+// 4️⃣ - Lógica para enviar el token al bot destino
+const despacharToken = async (bot_id, token, instance_name) => {
+    const urlBot = await obtenerURLBot(instance_name);
+    if (!urlBot)
+        throw new Error("No se pudo obtener la URL del bot");
+    const resp = await (0, node_fetch_1.default)(`${urlBot}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot_id, tokens: token }),
+    });
+    if (!resp.ok) {
+        const errorMsg = await resp.text();
+        throw new Error(`Error al enviar token: ${errorMsg}`);
+    }
+    console.log(`🚀 Token enviado al bot ${bot_id} (${urlBot}) correctamente.`);
+};
+// 5️⃣ - Función para obtener la URL del bot desde API externa o variable
 const obtenerURLBot = async (instance_name) => {
     if (instance_name === "bot_nacho") {
         console.log("🔁 Usando BOT_URL directamente para bot_nacho");
         return BOT_URL ?? null;
     }
     try {
-        const bodyUrl = JSON.stringify({ instance_name, url: "true" });
         const res = await (0, node_fetch_1.default)(API_URL_CLOUDFLARE, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: bodyUrl,
+            body: JSON.stringify({ instance_name, url: "true" }),
         });
         if (!res.ok)
             return null;
